@@ -90,20 +90,23 @@ async def startup_event():
 async def get_counters(mode: str = "NORMAL"):
     """
     Implements the required GET http://127.0.0.1:9001/counters endpoint with simulation modes.
-    Mode 'ERROR_500': Returns HTTP 500.
-    Mode 'CORRUPT': Returns a partially corrupted CSV.
-    Mode 'SLOW': Introduces a 5-second delay (simulating network congestion).
+    Checks the URL query parameter first, then falls back to the sticky command-line mode.
     """
+    global SIMULATION_MODE
     
-    if mode.upper() == "ERROR_500":
+    # Determine the effective mode: Use the query parameter if provided, otherwise use the global sticky mode
+    effective_mode = mode.upper() if mode.upper() != "NORMAL" else SIMULATION_MODE
+
+    if effective_mode == "ERROR_500":
         print(f"[{time.strftime('%H:%M:%S')}] Generator: Simulating HTTP 500 Internal Error.")
+        # This is where the error is raised, preventing the rest of the function from running.
         raise HTTPException(status_code=500, detail="Simulated Internal Server Error")
     
-    if mode.upper() == "SLOW":
+    if effective_mode == "SLOW":
         print(f"[{time.strftime('%H:%M:%S')}] Generator: Simulating 5s network congestion delay.")
         time.sleep(5)
     
-    corrupt = (mode.upper() == "CORRUPT")
+    corrupt = (effective_mode == "CORRUPT")
     
     # Re-generate data for fresh metrics on every call (simulating constant updates)
     generate_telemetry_snapshot()
