@@ -1,170 +1,174 @@
+# aggregator_server.py
 import uvicorn
 import asyncio
-import logging
 import time
-import httpx
 import pandas as pd
+import httpx
+import logging
+from fastapi import FastAPI, HTTPException
 from io import StringIO
-from fastapi import FastAPI, HTTPException, BackgroundTasks
-
 # --- Configuration ---
-INGESTION_INTERVAL_SECONDS = 10
 TELEMETRY_SOURCE_URL = "http://127.0.0.1:9001/counters"
-LOG_FILE = "aggregator_server.log"
+INGESTION_INTERVAL_SECONDS = 10 
+# Max time to wait for the generator to respond
+HTTP_TIMEOUT_SECONDS = 8 
 
-# --- Logging Setup (Bonus Requirement) ---
-logging.basicConfig(level=logging.INFO, 
-                    format='%(asctime)s - %(levelname)s - %(message)s',
-                    handlers=[
-                        logging.FileHandler(LOG_FILE, mode='w'),
-                        logging.StreamHandler()
-                    ])
-logger = logging.getLogger(__name__)
+# --- Logging Setup ---
+# This ensures logs go to both the file and the console for easier debugging and meets observability requirement.
+log_file_path = 'aggregator_server.log'
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file_path),  # Handler for the file
+        logging.StreamHandler()              # Handler for the console (Terminal 2)
+    ]
+)
 
-# --- 1. The RCU Data Store ---
-class TelemetryStore:
+# --- Core RCU Data Store Implementation ---
+
+class AggregatorServer:
     """
-    Manages the telemetry data using the Read-Copy-Update (RCU) pattern.
-    Reads (API lookups) are non-blocking. Writes (ingestion) are protected only
-    during the instantaneous atomic swap operation.
+    Implements the Read-Copy-Update (RCU) pattern for non-blocking reads.
+    The background task is the Writer; API endpoints are the Readers.
     """
     def __init__(self):
-        # The public, exposed data copy (Readers access this without a lock)
+        # The public data store (The 'Read' copy)
         self.current_data = {} 
-        # Lock to protect the single, atomic reference swap
-        self.lock = asyncio.Lock()
-        
-    def get_data(self):
-        """Returns the current snapshot for non-blocking reads."""
-        return self.current_data
+        # Lock protects only the instantaneous pointer swap, not the data access
+        self.swap_lock = asyncio.Lock() 
 
-    async def atomic_swap(self, new_snapshot: dict):
+    def get_data(self, switch_id: str = None, metric_name: str = None):
         """
-        Performs the atomic update (the RCU swap). 
-        The lock minimizes the time readers are blocked to microseconds.
+        Public method for non-blocking data access (The Read).
         """
-        async with self.lock:
-            # Atomic reference assignment to the new data snapshot
-            self.current_data = new_snapshot
-            logger.info(f"RCU Swap: Successfully updated store with {len(new_snapshot)} switch metrics.")
-
-# Create a single instance of the Store
-store = TelemetryStore()
-
-# --- 2. Ingestion Utilities and Task ---
-
-def parse_csv_to_dict(csv_content: str) -> dict:
-    """
-    Parses the CSV matrix from the generator into the required nested dictionary format.
-    Uses Pandas for robust, high-performance CSV parsing.
-    """
-    if not csv_content:
-        return {}
+        data = self.current_data
         
-    df = pd.read_csv(StringIO(csv_content))
-    
-    # Set 'switch_id' as the index
-    df = df.set_index('switch_id')
-    
-    # Convert DataFrame back to a nested dictionary for fast Python lookup
-    # {'SW-00': {'Bandwidth_Rx_Gbps': 45.2, ...}, ...}
-    return df.to_dict('index')
+        if not data:
+            raise HTTPException(status_code=503, detail="Data unavailable. Store is empty; waiting for initial ingestion.")
+        
+        if switch_id is None:
+            # ListMetrics request
+            return data
+        
+        # GetMetric request
+        if switch_id not in data:
+            raise HTTPException(status_code=404, detail=f"Switch ID '{switch_id}' not found.")
+        
+        if metric_name is None:
+            return data[switch_id]
 
-async def ingestion_task():
-    """
-    Background task to fetch data from the telemetry source and update the RCU store.
-    """
-    logger.info(f"Ingestion Task started. Polling URL: {TELEMETRY_SOURCE_URL}")
-    
-    # Use an async HTTP client for non-blocking I/O
-    async with httpx.AsyncClient(timeout=INGESTION_INTERVAL_SECONDS) as client:
+        if metric_name not in data[switch_id]:
+            valid_metrics = list(data[switch_id].keys())
+            raise HTTPException(status_code=404, detail=f"Metric '{metric_name}' not found for switch '{switch_id}'. Valid metrics are: {', '.join(valid_metrics)}")
+        
+        return {metric_name: data[switch_id][metric_name]}
+
+    def _parse_csv_to_dict(self, csv_content: str) -> dict:
+        """Parses the CSV content into the required nested dictionary format."""
+        
+        # Use pandas for robust, efficient CSV parsing
+        df = pd.read_csv(StringIO(csv_content))
+        df = df.set_index('switch_id')
+        
+        # Convert DataFrame to the required nested dictionary structure
+        return df.to_dict('index')
+
+    async def _swap_data(self, new_snapshot: dict):
+        """Performs the atomic RCU pointer swap."""
+        async with self.swap_lock:
+            # The instantaneous swap is the only part requiring a lock
+            self.current_data = new_snapshot 
+
+    async def ingestion_task(self):
+        """
+        Asynchronous background task to periodically fetch and update data (RCU Writer).
+        This loop is designed to be resilient and non-crashing.
+        """
+        # Client initialized here so it lives for the lifetime of the task
+        client = httpx.AsyncClient() 
+        
+        logging.info("Background ingestion task started.")
+
         while True:
             start_time = time.time()
+            
             try:
-                # --- FETCH DATA (I/O, outside of lock) ---
-                response = await client.get(TELEMETRY_SOURCE_URL)
-                response.raise_for_status() # Raise exception for 4xx/5xx status codes
-                csv_content = response.text
+                # 1. Fetch data from the generator
+                response = await client.get(TELEMETRY_SOURCE_URL, timeout=HTTP_TIMEOUT_SECONDS)
+                # raise_for_status() is key for error handling (raises exception for 4xx/5xx)
+                response.raise_for_status() 
 
-                # --- PARSE DATA (CPU, outside of lock) ---
-                new_data = parse_csv_to_dict(csv_content)
+                # 2. Parse data and perform RCU update
+                # Parsing is done *outside* the lock
+                new_data = self._parse_csv_to_dict(response.text)
                 
-                if not new_data:
-                    logger.warning("Ingestion: Received empty data snapshot.")
-                else:
-                    # --- ATOMIC SWAP (inside lock) ---
-                    await store.atomic_swap(new_data)
-                    
+                # Atomic RCU swap (protected by lock, but very fast)
+                await self._swap_data(new_data)
+                
+                end_time = time.time()
+                # Log performance stat
+                logging.info(f"RCU Swap: Successfully updated store. Time taken: {(end_time - start_time) * 1000:.0f}ms")
+
             except httpx.RequestError as e:
-                logger.error(f"Ingestion failed (HTTP Request Error): Cannot connect to generator on {TELEMETRY_SOURCE_URL}. Error: {e}")
+                # Catches network errors (connection refused, DNS) and HTTP status errors (500, 404)
+                logging.error(f"Ingestion failed (HTTP Request/Network Error): {e}. Retaining old data.")
             except Exception as e:
-                logger.error(f"Ingestion failed (Parsing/General Error): {e}")
-            
-            # --- Performance/Observability Logging ---
-            end_time = time.time()
-            latency = (end_time - start_time) * 1000
-            logger.info(f"Ingestion cycle completed. Time taken: {latency:.2f}ms.")
-            
-            # Wait for the next cycle
+                # Catches all other errors, primarily parsing failures (e.g., CORRUPT mode)
+                logging.error(f"Ingestion failed (Parsing/General Error): {e}. Retaining old data.")
+
+            # 3. Pause for the next cycle (crucial for concurrency)
             await asyncio.sleep(INGESTION_INTERVAL_SECONDS)
 
-# --- 3. FastAPI Application ---
-app = FastAPI(title="Network Telemetry Aggregator (Metrics Server)", 
-              description="High-performance, non-blocking telemetry API using RCU.")
+# --- FastAPI App Setup ---
+app = FastAPI(title="Metrics Aggregation Server")
+
+# Instantiate the data store globally
+telemetry_store = AggregatorServer() 
 
 @app.on_event("startup")
 async def startup_event():
-    # Start the background data ingestion task
-    asyncio.create_task(ingestion_task())
-    logger.info("Metrics Server is running and Ingestion Task has been initiated.")
+    """Starts the background ingestion task when the server starts."""
+    logging.info("Application startup initiated. Starting ingestion task...")
+    
+    # CORRECT FIX: Call the method on the instantiated object (telemetry_store)
+    # This prevents the "missing 'self'" error
+    asyncio.create_task(telemetry_store.ingestion_task()) 
+
+
+# --- API Endpoints (Readers) ---
+
+# In aggregator_server.py
 
 @app.get("/telemetry/ListMetrics", 
          summary="Fetch all current metrics for all switches.",
          response_model=dict)
 async def list_metrics():
-    """
-    Fetches a list of all metrics and their values for every switch in the fabric.
-    This is a highly performant, non-blocking read operation.
-    """
-    # The reader accesses the public copy directly, without a lock (RCU pattern)
-    data = store.get_data()
+    """Retrieves the full telemetry snapshot from the RCU store."""
     
-    if not data:
-        raise HTTPException(status_code=503, detail="Data unavailable. Store is empty or ingestion is not yet complete.")
+    start_time = time.time()  # Start timer
     
-    return data
+    # 1. Get data (fast, non-blocking RCU read)
+    response_data = telemetry_store.get_data()
+    
+    end_time = time.time()
+    latency_ms = (end_time - start_time) * 1000
+    
+    # 2. Log API latency (New Requirement)
+    logging.info(f"API Latency: ListMetrics completed in {latency_ms:.2f}ms.")
+    
+    return response_data
 
 @app.get("/telemetry/GetMetric", 
-         summary="Fetch the current value of a specific metric for a specific switch.",
+         summary="Fetch a specific metric value for a given switch ID.",
          response_model=dict)
-async def get_metric(switch_id: str, metric_name: str):
-    """
-    Fetches the current value of a single metric for a specified switch.
-    """
-    # The reader accesses the public copy directly (RCU pattern)
-    all_data = store.get_data()
+async def get_metric(switch_id: str, metric_name: str = None):
+    """Retrieves a specific metric or all metrics for one switch."""
+    if metric_name:
+        return telemetry_store.get_data(switch_id=switch_id, metric_name=metric_name)
+    else:
+        return telemetry_store.get_data(switch_id=switch_id)
 
-    # 1. Check if store is populated
-    if not all_data:
-        raise HTTPException(status_code=503, detail="Data unavailable. Store is empty.")
-    
-    # 2. Check if switch exists
-    switch_data = all_data.get(switch_id.upper())
-    if not switch_data:
-        raise HTTPException(status_code=404, detail=f"Switch ID '{switch_id.upper()}' not found.")
-        
-    # 3. Check if metric exists
-    metric_value = switch_data.get(metric_name)
-    if metric_value is None:
-        valid_metrics = list(switch_data.keys())
-        raise HTTPException(status_code=404, detail=f"Metric '{metric_name}' not found for switch '{switch_id.upper()}'. Valid metrics are: {', '.join(valid_metrics)}")
-
-    return {
-        "switch_id": switch_id.upper(),
-        "metric_name": metric_name,
-        "value": metric_value
-    }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8080)
-# --- End of aggregator_server.py ---
