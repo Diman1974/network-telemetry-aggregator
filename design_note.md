@@ -1,4 +1,4 @@
-# Telemetry Aggregator: Scaling and Production Design Note (Requirement 5)
+# Telemetry Aggregator: Scaling and Production Design Note 
 
 This document outlines the scaling characteristics, performance profile, and proposed deployment strategy for the Telemetry Aggregator service.
 
@@ -57,3 +57,4 @@ Once the single host machine's CPU or RAM limits are reached, the system must sc
 ## 4. Ultimate Performance Ceiling: Transition to Native Code
 
 If, after all Python-based optimizations are exhausted, the core aggregation logic remains persistently CPU-bound due to the Python GIL, the final solution is migrating those critical components to native code (C++). This provides significantly faster execution and eliminates GIL constraints, allowing for true parallel processing of data aggregation.
+
