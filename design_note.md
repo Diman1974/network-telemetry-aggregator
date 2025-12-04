@@ -4,7 +4,7 @@ This document outlines the scaling characteristics, performance profile, and pro
 
 ## 1. Phase 0: Single Worker (Initial Solution)
 
-The initial deployment runs as a single, asynchronous worker process. The architecture utilizes a Read-Copy-Update (RCU) pattern combined with fully asynchronous I/O and non-blocking parsing (Requirement 1 & 2 fixes).
+The initial deployment runs as a single, asynchronous worker process. The architecture utilizes a Read-Copy-Update (RCU) pattern combined with fully asynchronous I/O and non-blocking parsing.
 
 ### Metric Characteristics
 
@@ -57,4 +57,5 @@ Once the single host machine's CPU or RAM limits are reached, the system must sc
 ## 4. Ultimate Performance Ceiling: Transition to Native Code
 
 If, after all Python-based optimizations are exhausted, the core aggregation logic remains persistently CPU-bound due to the Python GIL, the final solution is migrating those critical components to native code (C++). This provides significantly faster execution and eliminates GIL constraints, allowing for true parallel processing of data aggregation.
+
 
